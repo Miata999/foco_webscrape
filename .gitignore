@@ -1,3 +1,7 @@
+downloads/audio/
+downloads/documents/
+downloads/videos/
+
 # Python
 __pycache__/
 *.py[cod]
