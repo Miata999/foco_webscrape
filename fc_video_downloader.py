@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Fort Collins Meeting Video Downloader
-Downloads meeting videos and audio files based on the CSV database created by the scraper
+Enhanced Fort Collins Meeting Video Downloader
+Downloads meeting videos and audio files based on the CSV database with archive tracking
 """
 
 import pandas as pd
@@ -14,12 +14,15 @@ from pathlib import Path
 import re
 from tqdm import tqdm
 import argparse
+import json
+import hashlib
+from datetime import datetime
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class FortCollinsVideoDownloader:
+class EnhancedFortCollinsVideoDownloader:
     def __init__(self, csv_file='fort_collins_meetings.csv', download_dir='downloads'):
         self.csv_file = csv_file
         self.download_dir = Path(download_dir)
@@ -30,13 +33,88 @@ class FortCollinsVideoDownloader:
         (self.download_dir / 'audio').mkdir(exist_ok=True)
         (self.download_dir / 'documents').mkdir(exist_ok=True)
         
+        # Archive tracking
+        self.archive_file = self.download_dir / 'download_archive.json'
+        self.downloaded_files = []
+        self.failed_downloads = []
+        self.archive_data = self.load_archive()
+        
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
+    
+    def load_archive(self):
+        """Load the download archive to track what's been downloaded"""
+        if self.archive_file.exists():
+            try:
+                with open(self.archive_file, 'r') as f:
+                    archive = json.load(f)
+                logger.info(f"Loaded archive with {len(archive.get('downloads', []))} tracked files")
+                return archive
+            except Exception as e:
+                logger.warning(f"Error loading archive: {e}")
+                return {'downloads': [], 'last_updated': None}
+        else:
+            logger.info("No existing archive found, creating new one")
+            return {'downloads': [], 'last_updated': None}
+    
+    def save_archive(self):
+        """Save the download archive"""
+        self.archive_data['last_updated'] = datetime.now().isoformat()
+        try:
+            with open(self.archive_file, 'w') as f:
+                json.dump(self.archive_data, f, indent=2)
+            logger.info(f"Archive saved with {len(self.archive_data['downloads'])} tracked files")
+        except Exception as e:
+            logger.error(f"Error saving archive: {e}")
+    
+    def generate_file_hash(self, url, meeting_title, date, file_type):
+        """Generate a unique hash for a file based on its metadata"""
+        # Create a unique identifier for the file
+        identifier = f"{url}_{meeting_title}_{date}_{file_type}"
+        return hashlib.md5(identifier.encode()).hexdigest()
+    
+    def is_file_downloaded(self, url, meeting_title, date, file_type):
+        """Check if a file has already been downloaded based on archive"""
+        file_hash = self.generate_file_hash(url, meeting_title, date, file_type)
         
-        self.downloaded_files = []
-        self.failed_downloads = []
+        # Check if this hash exists in our archive
+        for download_record in self.archive_data['downloads']:
+            if download_record.get('file_hash') == file_hash:
+                # Verify the file actually exists
+                file_path = Path(download_record.get('file_path', ''))
+                if file_path.exists():
+                    logger.debug(f"File already downloaded: {file_path.name}")
+                    return True, file_path
+                else:
+                    # File was recorded but doesn't exist, remove from archive
+                    logger.warning(f"Archived file not found: {file_path}")
+                    self.archive_data['downloads'] = [d for d in self.archive_data['downloads'] if d.get('file_hash') != file_hash]
+        
+        return False, None
+    
+    def add_to_archive(self, url, meeting_title, date, file_type, file_path, file_size):
+        """Add a successfully downloaded file to the archive"""
+        file_hash = self.generate_file_hash(url, meeting_title, date, file_type)
+        
+        download_record = {
+            'file_hash': file_hash,
+            'url': url,
+            'meeting_title': meeting_title,
+            'date': date,
+            'file_type': file_type,
+            'file_path': str(file_path),
+            'file_size': file_size,
+            'downloaded_at': datetime.now().isoformat(),
+            'filename': file_path.name
+        }
+        
+        # Remove any existing record with the same hash
+        self.archive_data['downloads'] = [d for d in self.archive_data['downloads'] if d.get('file_hash') != file_hash]
+        
+        # Add new record
+        self.archive_data['downloads'].append(download_record)
     
     def load_csv_data(self):
         """Load meeting data from CSV"""
@@ -81,11 +159,6 @@ class FortCollinsVideoDownloader:
     def download_file(self, url, local_path, chunk_size=8192):
         """Download a file with progress bar"""
         try:
-            # Check if file already exists
-            if local_path.exists():
-                logger.info(f"File already exists: {local_path.name}")
-                return True
-            
             # Start download
             response = self.session.get(url, stream=True, timeout=30)
             response.raise_for_status()
@@ -106,20 +179,22 @@ class FortCollinsVideoDownloader:
                         if chunk:
                             f.write(chunk)
             
-            logger.info(f"Downloaded: {local_path.name} ({total_size:,} bytes)")
-            return True
+            # Get actual file size
+            actual_size = local_path.stat().st_size
+            logger.info(f"Downloaded: {local_path.name} ({actual_size:,} bytes)")
+            return True, actual_size
             
         except requests.RequestException as e:
             logger.error(f"Download failed for {url}: {e}")
             # Clean up partial file
             if local_path.exists():
                 local_path.unlink()
-            return False
+            return False, 0
         except Exception as e:
             logger.error(f"Unexpected error downloading {url}: {e}")
             if local_path.exists():
                 local_path.unlink()
-            return False
+            return False, 0
     
     def download_meeting_files(self, meeting_row, download_videos=True, download_audio=True, download_docs=True):
         """Download all files for a specific meeting"""
@@ -129,68 +204,116 @@ class FortCollinsVideoDownloader:
         logger.info(f"Processing: {title} ({date})")
         
         files_downloaded = []
+        files_skipped = 0
         
         # Download video files
         if download_videos and pd.notna(meeting_row.get('video_link', '')) and meeting_row['video_link']:
             video_url = meeting_row['video_link']
-            filename = self.get_filename_from_url(video_url, title, date, 'video')
-            video_path = self.download_dir / 'videos' / filename
             
-            if self.download_file(video_url, video_path):
-                files_downloaded.append(str(video_path))
+            # Check if already downloaded
+            is_downloaded, existing_path = self.is_file_downloaded(video_url, title, date, 'video')
+            if is_downloaded:
+                files_skipped += 1
+                logger.info(f"Skipped (already downloaded): {existing_path.name}")
             else:
-                self.failed_downloads.append({'url': video_url, 'type': 'video', 'meeting': title})
+                filename = self.get_filename_from_url(video_url, title, date, 'video')
+                video_path = self.download_dir / 'videos' / filename
+                
+                success, file_size = self.download_file(video_url, video_path)
+                if success:
+                    files_downloaded.append(str(video_path))
+                    self.add_to_archive(video_url, title, date, 'video', video_path, file_size)
+                else:
+                    self.failed_downloads.append({'url': video_url, 'type': 'video', 'meeting': title})
         
         # Download MP4 downloads (if different from video_link)
         if download_videos and pd.notna(meeting_row.get('mp4_download', '')) and meeting_row['mp4_download']:
             mp4_url = meeting_row['mp4_download']
             if mp4_url != meeting_row.get('video_link', ''):  # Avoid duplicates
-                filename = self.get_filename_from_url(mp4_url, title, date, 'video')
-                mp4_path = self.download_dir / 'videos' / filename
                 
-                if self.download_file(mp4_url, mp4_path):
-                    files_downloaded.append(str(mp4_path))
+                # Check if already downloaded
+                is_downloaded, existing_path = self.is_file_downloaded(mp4_url, title, date, 'mp4')
+                if is_downloaded:
+                    files_skipped += 1
+                    logger.info(f"Skipped (already downloaded): {existing_path.name}")
                 else:
-                    self.failed_downloads.append({'url': mp4_url, 'type': 'mp4', 'meeting': title})
+                    filename = self.get_filename_from_url(mp4_url, title, date, 'video')
+                    mp4_path = self.download_dir / 'videos' / filename
+                    
+                    success, file_size = self.download_file(mp4_url, mp4_path)
+                    if success:
+                        files_downloaded.append(str(mp4_path))
+                        self.add_to_archive(mp4_url, title, date, 'mp4', mp4_path, file_size)
+                    else:
+                        self.failed_downloads.append({'url': mp4_url, 'type': 'mp4', 'meeting': title})
         
         # Download audio files
         if download_audio and pd.notna(meeting_row.get('audio_link', '')) and meeting_row['audio_link']:
             audio_url = meeting_row['audio_link']
-            filename = self.get_filename_from_url(audio_url, title, date, 'audio')
-            audio_path = self.download_dir / 'audio' / filename
             
-            if self.download_file(audio_url, audio_path):
-                files_downloaded.append(str(audio_path))
+            # Check if already downloaded
+            is_downloaded, existing_path = self.is_file_downloaded(audio_url, title, date, 'audio')
+            if is_downloaded:
+                files_skipped += 1
+                logger.info(f"Skipped (already downloaded): {existing_path.name}")
             else:
-                self.failed_downloads.append({'url': audio_url, 'type': 'audio', 'meeting': title})
+                filename = self.get_filename_from_url(audio_url, title, date, 'audio')
+                audio_path = self.download_dir / 'audio' / filename
+                
+                success, file_size = self.download_file(audio_url, audio_path)
+                if success:
+                    files_downloaded.append(str(audio_path))
+                    self.add_to_archive(audio_url, title, date, 'audio', audio_path, file_size)
+                else:
+                    self.failed_downloads.append({'url': audio_url, 'type': 'audio', 'meeting': title})
         
         # Download documents (PDFs)
         if download_docs:
             # Agenda PDF
             if pd.notna(meeting_row.get('agenda_pdf', '')) and meeting_row['agenda_pdf']:
                 agenda_url = meeting_row['agenda_pdf']
-                filename = self.get_filename_from_url(agenda_url, f"{title}_agenda", date, 'doc')
-                doc_path = self.download_dir / 'documents' / filename
                 
-                if self.download_file(agenda_url, doc_path):
-                    files_downloaded.append(str(doc_path))
+                # Check if already downloaded
+                is_downloaded, existing_path = self.is_file_downloaded(agenda_url, f"{title}_agenda", date, 'agenda_pdf')
+                if is_downloaded:
+                    files_skipped += 1
+                    logger.info(f"Skipped (already downloaded): {existing_path.name}")
                 else:
-                    self.failed_downloads.append({'url': agenda_url, 'type': 'agenda_pdf', 'meeting': title})
+                    filename = self.get_filename_from_url(agenda_url, f"{title}_agenda", date, 'doc')
+                    doc_path = self.download_dir / 'documents' / filename
+                    
+                    success, file_size = self.download_file(agenda_url, doc_path)
+                    if success:
+                        files_downloaded.append(str(doc_path))
+                        self.add_to_archive(agenda_url, f"{title}_agenda", date, 'agenda_pdf', doc_path, file_size)
+                    else:
+                        self.failed_downloads.append({'url': agenda_url, 'type': 'agenda_pdf', 'meeting': title})
             
             # Minutes PDF
             if pd.notna(meeting_row.get('minutes_pdf', '')) and meeting_row['minutes_pdf']:
                 minutes_url = meeting_row['minutes_pdf']
-                filename = self.get_filename_from_url(minutes_url, f"{title}_minutes", date, 'doc')
-                doc_path = self.download_dir / 'documents' / filename
                 
-                if self.download_file(minutes_url, doc_path):
-                    files_downloaded.append(str(doc_path))
+                # Check if already downloaded
+                is_downloaded, existing_path = self.is_file_downloaded(minutes_url, f"{title}_minutes", date, 'minutes_pdf')
+                if is_downloaded:
+                    files_skipped += 1
+                    logger.info(f"Skipped (already downloaded): {existing_path.name}")
                 else:
-                    self.failed_downloads.append({'url': minutes_url, 'type': 'minutes_pdf', 'meeting': title})
+                    filename = self.get_filename_from_url(minutes_url, f"{title}_minutes", date, 'doc')
+                    doc_path = self.download_dir / 'documents' / filename
+                    
+                    success, file_size = self.download_file(minutes_url, doc_path)
+                    if success:
+                        files_downloaded.append(str(doc_path))
+                        self.add_to_archive(minutes_url, f"{title}_minutes", date, 'minutes_pdf', doc_path, file_size)
+                    else:
+                        self.failed_downloads.append({'url': minutes_url, 'type': 'minutes_pdf', 'meeting': title})
         
         if files_downloaded:
             self.downloaded_files.extend(files_downloaded)
-            logger.info(f"Downloaded {len(files_downloaded)} files for meeting: {title}")
+            logger.info(f"Downloaded {len(files_downloaded)} new files, skipped {files_skipped} existing files for meeting: {title}")
+        elif files_skipped > 0:
+            logger.info(f"Skipped {files_skipped} existing files for meeting: {title}")
         else:
             logger.warning(f"No files downloaded for meeting: {title}")
         
@@ -243,6 +366,7 @@ class FortCollinsVideoDownloader:
             return
         
         logger.info(f"Starting download of files for {len(filtered_df)} meetings...")
+        logger.info(f"Archive contains {len(self.archive_data['downloads'])} previously downloaded files")
         
         # Download files for each meeting
         for index, meeting in filtered_df.iterrows():
@@ -255,26 +379,47 @@ class FortCollinsVideoDownloader:
                 logger.error(f"Error processing meeting {meeting['title']}: {e}")
                 continue
         
+        # Save archive after all downloads
+        self.save_archive()
+        
         # Print summary
         self.print_summary()
     
     def print_summary(self):
         """Print download summary"""
-        print(f"\n=== DOWNLOAD SUMMARY ===")
-        print(f"Successfully downloaded: {len(self.downloaded_files)} files")
+        print(f"\n=== ENHANCED DOWNLOAD SUMMARY ===")
+        print(f"Successfully downloaded: {len(self.downloaded_files)} new files")
         print(f"Failed downloads: {len(self.failed_downloads)}")
+        print(f"Total files in archive: {len(self.archive_data['downloads'])}")
         
         if self.downloaded_files:
-            print(f"\nDownloaded files saved to: {self.download_dir}")
+            print(f"\nNew files saved to: {self.download_dir}")
             
         if self.failed_downloads:
             print(f"\nFailed downloads:")
             for failed in self.failed_downloads:
                 print(f"  - {failed['type']}: {failed['meeting']} ({failed['url']})")
+        
+        # Archive statistics
+        if self.archive_data['downloads']:
+            total_size = sum(d.get('file_size', 0) for d in self.archive_data['downloads'])
+            print(f"\nArchive statistics:")
+            print(f"  Total files: {len(self.archive_data['downloads'])}")
+            print(f"  Total size: {total_size:,} bytes ({total_size / (1024**3):.2f} GB)")
+            
+            # File type breakdown
+            file_types = {}
+            for download in self.archive_data['downloads']:
+                file_type = download.get('file_type', 'unknown')
+                file_types[file_type] = file_types.get(file_type, 0) + 1
+            
+            print(f"  File types:")
+            for file_type, count in file_types.items():
+                print(f"    {file_type}: {count}")
 
 def main():
     """Main function with command line argument parsing"""
-    parser = argparse.ArgumentParser(description='Download Fort Collins meeting videos and documents')
+    parser = argparse.ArgumentParser(description='Enhanced Fort Collins meeting video and document downloader')
     parser.add_argument('--csv', default='fort_collins_meetings.csv', help='CSV file with meeting data')
     parser.add_argument('--output', default='downloads', help='Output directory for downloads')
     parser.add_argument('--types', nargs='+', help='Meeting types to download (e.g., "City Council Regular Meeting")')
@@ -282,11 +427,33 @@ def main():
     parser.add_argument('--no-videos', action='store_true', help='Skip video downloads')
     parser.add_argument('--no-audio', action='store_true', help='Skip audio downloads')
     parser.add_argument('--no-docs', action='store_true', help='Skip document downloads')
+    parser.add_argument('--show-archive', action='store_true', help='Show archive statistics and exit')
     
     args = parser.parse_args()
     
     try:
-        downloader = FortCollinsVideoDownloader(args.csv, args.output)
+        downloader = EnhancedFortCollinsVideoDownloader(args.csv, args.output)
+        
+        if args.show_archive:
+            # Just show archive info
+            print("=== DOWNLOAD ARCHIVE ===")
+            print(f"Archive file: {downloader.archive_file}")
+            print(f"Total tracked files: {len(downloader.archive_data['downloads'])}")
+            if downloader.archive_data['last_updated']:
+                print(f"Last updated: {downloader.archive_data['last_updated']}")
+            
+            if downloader.archive_data['downloads']:
+                total_size = sum(d.get('file_size', 0) for d in downloader.archive_data['downloads'])
+                print(f"Total size: {total_size:,} bytes ({total_size / (1024**3):.2f} GB)")
+                
+                # Show recent downloads
+                print(f"\nRecent downloads:")
+                recent_downloads = sorted(downloader.archive_data['downloads'], 
+                                        key=lambda x: x.get('downloaded_at', ''), reverse=True)[:10]
+                for download in recent_downloads:
+                    print(f"  {download.get('downloaded_at', '')[:10]} - {download.get('filename', '')}")
+            return
+        
         downloader.download_all(
             meeting_types=args.types,
             limit=args.limit,
