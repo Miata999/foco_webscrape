@@ -92,12 +92,12 @@ class EnhancedFortCollinsVideoDownloader:
         except Exception as e:
             logger.error(f"Error saving archive: {e}")
 
-    def generate_file_hash(self, url: str, meeting_title: str, date: str, file_type: str) -> str:
+    def generate_file_hash(self, url, meeting_title, date, file_type):
         """Generate a unique hash for a file based on its metadata."""
         identifier = f"{url}_{meeting_title}_{date}_{file_type}"
         return hashlib.md5(identifier.encode()).hexdigest()
 
-    def is_file_downloaded(self, url: str, meeting_title: str, date: str, file_type: str) -> tuple[bool, Path | None]:
+    def is_file_downloaded(self, url, meeting_title, date, file_type):
         """Check if a file has already been downloaded."""
         file_hash = self.generate_file_hash(url, meeting_title, date, file_type)
         for download_record in self.archive_data['downloads']:
@@ -111,7 +111,7 @@ class EnhancedFortCollinsVideoDownloader:
                     self.archive_data['downloads'] = [d for d in self.archive_data['downloads'] if d.get('file_hash') != file_hash]
         return False, None
 
-    def add_to_archive(self, url: str, meeting_title: str, date: str, file_type: str, file_path: Path, file_size: int) -> None:
+    def add_to_archive(self, url, meeting_title, date, file_type, file_path, file_size):
         """Record a successfully downloaded file in the archive."""
         file_hash = self.generate_file_hash(url, meeting_title, date, file_type)
         download_record = {
@@ -128,7 +128,7 @@ class EnhancedFortCollinsVideoDownloader:
         self.archive_data['downloads'] = [d for d in self.archive_data['downloads'] if d.get('file_hash') != file_hash]
         self.archive_data['downloads'].append(download_record)
 
-    def load_csv_data(self) -> pd.DataFrame | None:
+    def load_csv_data(self):
         """Load meeting metadata from CSV."""
         try:
             df = pd.read_csv(self.csv_file)
@@ -141,13 +141,13 @@ class EnhancedFortCollinsVideoDownloader:
             logger.error(f"Error reading CSV: {e}")
             return None
 
-    def sanitize_filename(self, filename: str) -> str:
+    def sanitize_filename(self, filename):
         """Sanitize a filename for saving to disk."""
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
         filename = re.sub(r'[\s]+', '_', filename)
         return filename.strip('._')[:200]
 
-    def get_filename_from_url(self, url: str, meeting_title: str, date: str, file_type: str = 'video') -> str:
+    def get_filename_from_url(self, url, meeting_title, date, file_type='video'):
         """Generate a friendly filename based on meeting info and URL."""
         parsed_url = urlparse(url)
         original_name = os.path.basename(unquote(parsed_url.path))
@@ -167,7 +167,7 @@ class EnhancedFortCollinsVideoDownloader:
                 extension = '.pdf'
         return f"{clean_date}_{clean_title}{extension}"
 
-    def download_file(self, url: str, local_path: Path, chunk_size: int = 8192) -> int:
+    def download_file(self, url, local_path, chunk_size=8192):
         """Download a file from a URL with a progress bar.  Returns the number of bytes saved."""
         try:
             response = self.session.get(url, stream=True, timeout=30)
@@ -192,7 +192,7 @@ class EnhancedFortCollinsVideoDownloader:
             logger.error(f"Error downloading {url}: {e}")
             return 0
 
-    def filter_meetings(self, df: pd.DataFrame, meeting_types: list[str] | None = None, date_range: tuple | None = None, limit: int | None = None) -> pd.DataFrame:
+    def filter_meetings(self, df, meeting_types=None, date_range=None, limit=None):
         """Filter the dataframe by meeting types, date range and limit."""
         filtered_df = df.copy()
         if meeting_types:
@@ -212,25 +212,29 @@ class EnhancedFortCollinsVideoDownloader:
             logger.info(f"Limited to {len(filtered_df)} meetings")
         return filtered_df
 
-    def download_meeting_files(self, meeting: pd.Series, download_videos: bool, download_audio: bool, download_docs: bool) -> None:
+    def download_meeting_files(self, meeting, download_videos, download_audio, download_docs):
         """Download available files for a single meeting row."""
         title = meeting.get('title', '')
         date = meeting.get('date', '')
         # Video
         if download_videos:
             video_url = meeting.get('mp4_download') or meeting.get('video_link')
-            if video_url:
-                already, existing = self.is_file_downloaded(video_url, title, date, 'video')
-                if not already:
-                    filename = self.get_filename_from_url(video_url, title, date, 'video')
-                    local_path = self.download_dir / 'videos' / filename
-                    logger.info(f"Downloading video: {title} ({date})")
-                    size = self.download_file(video_url, local_path)
-                    if size > 0:
-                        self.add_to_archive(video_url, title, date, 'video', local_path, size)
-                        self.downloaded_files.append({'type': 'video', 'meeting': title, 'url': video_url})
-                    else:
-                        self.failed_downloads.append({'type': 'video', 'meeting': title, 'url': video_url})
+            if video_url and pd.notna(video_url) and str(video_url).strip():
+                # Skip if it's just a Cablecast page URL (not a direct download)
+                if 'cablecast.tv/CablecastPublicSite/show/' in str(video_url):
+                    logger.debug(f"Skipping Cablecast page URL (not direct download): {title}")
+                else:
+                    already, existing = self.is_file_downloaded(video_url, title, date, 'video')
+                    if not already:
+                        filename = self.get_filename_from_url(video_url, title, date, 'video')
+                        local_path = self.download_dir / 'videos' / filename
+                        logger.info(f"Downloading video: {title} ({date})")
+                        size = self.download_file(video_url, local_path)
+                        if size > 0:
+                            self.add_to_archive(video_url, title, date, 'video', local_path, size)
+                            self.downloaded_files.append({'type': 'video', 'meeting': title, 'url': video_url})
+                        else:
+                            self.failed_downloads.append({'type': 'video', 'meeting': title, 'url': video_url})
         # Audio
         if download_audio:
             audio_url = meeting.get('audio_link')
@@ -271,8 +275,8 @@ class EnhancedFortCollinsVideoDownloader:
                 else:
                     self.failed_downloads.append({'type': file_type, 'meeting': title, 'url': url})
 
-    def download_all(self, meeting_types: list[str] | None = None, date_range: tuple | None = None, limit: int | None = None,
-                     download_videos: bool = True, download_audio: bool = True, download_docs: bool = True) -> None:
+    def download_all(self, meeting_types=None, date_range=None, limit=None,
+                                            download_videos=True, download_audio=True, download_docs=True):
         """Download all requested files based on filters."""
         df = self.load_csv_data()
         if df is None:
