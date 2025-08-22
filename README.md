@@ -17,7 +17,8 @@ This project consists of two main components:
 - **Progress Tracking**: Real-time progress bars and detailed logging
 - **Error Handling**: Robust error handling with retry logic and failed download tracking
 - **Filtering Options**: Filter downloads by meeting type, date range, or limit number of meetings
-- **Resume Capability**: Skips already downloaded files
+- **Smart Archive System**: Tracks downloaded files to prevent re-downloading when processing new CSV files
+- **Archive Management**: View archive statistics and manage downloaded content
 
 ## Installation
 
@@ -74,6 +75,9 @@ python fc_video_downloader.py --no-audio --no-docs
 
 # Use custom CSV file and output directory
 python fc_video_downloader.py --csv my_meetings.csv --output my_downloads
+
+# View archive statistics
+python fc_video_downloader.py --show-archive
 ```
 
 ## Command Line Options
@@ -87,6 +91,7 @@ python fc_video_downloader.py --csv my_meetings.csv --output my_downloads
 - `--no-videos`: Skip video downloads
 - `--no-audio`: Skip audio downloads
 - `--no-docs`: Skip document downloads
+- `--show-archive`: Show archive statistics and exit
 
 ## Output Structure
 
@@ -96,7 +101,8 @@ After running the downloader, files will be organized as follows:
 downloads/
 ├── videos/          # MP4 video files
 ├── audio/           # Audio files (MP3, WAV)
-└── documents/       # PDF agendas and minutes
+├── documents/       # PDF agendas and minutes
+└── download_archive.json  # Archive tracking file
 ```
 
 ## Meeting Types
@@ -151,7 +157,23 @@ python fc_video_downloader.py
 ```bash
 # Download to a custom directory with only videos and documents
 python fc_video_downloader.py --output "fort_collins_archive" --no-audio
+
+# Check archive statistics
+python fc_video_downloader.py --show-archive
+
+# Process new CSV without re-downloading existing files
+python fc_video_downloader.py --csv new_meetings.csv
 ```
+
+## Archive System
+
+The enhanced downloader includes a smart archive system:
+
+- **Download Tracking**: Automatically tracks all downloaded files with metadata
+- **Duplicate Prevention**: Prevents re-downloading files when processing new CSV files
+- **Archive Statistics**: View total files, sizes, and file type breakdowns
+- **File Verification**: Verifies downloaded files still exist before skipping
+- **Archive Management**: JSON-based archive file for easy inspection and backup
 
 ## Error Handling
 
