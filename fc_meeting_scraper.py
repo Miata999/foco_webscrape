@@ -50,6 +50,7 @@ import logging
 from datetime import datetime
 import os
 import json
+from typing import Union, Dict, Optional, List
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -89,6 +90,143 @@ class FortCollinsVideoScraper:
                 else:
                     logger.error(f"Failed to fetch {url} after {max_retries} attempts")
                     return None
+
+    def _extract_media_urls_from_html(self, soup: BeautifulSoup, base_url: str) -> Dict[str, List[str]]:
+        """Extract media URLs from common HTML elements and script text.
+
+        Returns a dict with keys: mp4, mpeg, m3u8 containing URL lists.
+        """
+        media: Dict[str, List[str]] = {'mp4': [], 'mpeg': [], 'm3u8': []}
+
+        def add_url(kind: str, url_val: str) -> None:
+            if not url_val:
+                return
+            if not url_val.startswith('http'):
+                url_val = urljoin(base_url, url_val)
+            if url_val not in media[kind]:
+                media[kind].append(url_val)
+
+        # Elements with src/href
+        for tag_name, attr in [('a', 'href'), ('source', 'src'), ('video', 'src'), ('link', 'href')]:
+            for tag in soup.find_all(tag_name):
+                val = tag.get(attr, '')
+                if not val:
+                    continue
+                low = val.lower()
+                if '.mp4' in low:
+                    add_url('mp4', val)
+                if '.mpeg' in low:
+                    add_url('mpeg', val)
+                if '.m3u8' in low:
+                    add_url('m3u8', val)
+
+        # Meta video
+        for meta in soup.find_all('meta'):
+            prop = (meta.get('property') or meta.get('name') or '').lower()
+            if 'video' in prop:
+                content = meta.get('content', '')
+                if '.mp4' in (content or '').lower():
+                    add_url('mp4', content)
+
+        # Script text scanning
+        combined_script = '\n'.join([s.get_text(' ', strip=False) for s in soup.find_all('script')])
+        if combined_script:
+            for pattern, kind in [
+                (r'https?://[^"\'\s>]+\.mp4[^"\'\s>]*', 'mp4'),
+                (r'https?://[^"\'\s>]+\.mpeg[^"\'\s>]*', 'mpeg'),
+                (r'https?://[^"\'\s>]+\.m3u8[^"\'\s>]*', 'm3u8'),
+            ]:
+                try:
+                    for match in re.findall(pattern, combined_script, flags=re.IGNORECASE):
+                        add_url(kind, match)
+                except re.error:
+                    continue
+
+        return media
+
+    def _follow_embeds_and_players(self, page_url: str, soup: BeautifulSoup, video_id: Optional[int]) -> Dict[str, List[str]]:
+        """Follow iframes/player links likely to contain direct media URLs and aggregate results."""
+        aggregated: Dict[str, List[str]] = {'mp4': [], 'mpeg': [], 'm3u8': []}
+
+        def merge(found: Dict[str, List[str]]):
+            for k in aggregated.keys():
+                for u in found.get(k, []):
+                    if u not in aggregated[k]:
+                        aggregated[k].append(u)
+
+        # Discover iframe/player links from current soup
+        candidate_links: List[str] = []
+        for iframe in soup.find_all(['iframe']):
+            src = iframe.get('src', '')
+            if src:
+                candidate_links.append(urljoin(page_url, src))
+        # Anchor links that look like players or embeds
+        for a in soup.find_all('a'):
+            href = a.get('href', '')
+            if href and any(token in href.lower() for token in ['embed', 'iframe', 'player']):
+                candidate_links.append(urljoin(page_url, href))
+
+        # Try common Cablecast embed patterns by ID if known
+        if video_id is not None:
+            embed_candidates = [
+                f"https://reflect-vod-fcgov.cablecast.tv/CablecastPublicSite/resource/embed/iframe?show={video_id}&site=1",
+                f"https://reflect-vod-fcgov.cablecast.tv/internetchannel/embed?show={video_id}&site=1",
+                f"https://reflect-vod-fcgov.cablecast.tv/internetchannel/resource/embed/iframe?show={video_id}&site=1",
+            ]
+            candidate_links.extend(embed_candidates)
+
+        # Fetch each candidate and extract media
+        for url in list(dict.fromkeys(candidate_links)):
+            try:
+                resp = self.fetch_page(url)
+                if not resp:
+                    continue
+                child_soup = BeautifulSoup(resp.content, 'html.parser')
+                media = self._extract_media_urls_from_html(child_soup, url)
+                merge(media)
+            except Exception as e:
+                logger.debug(f"Error following embed {url}: {e}")
+
+        return aggregated
+
+    def _pick_best_media_for_id(self, candidates: List[str], video_id: Optional[int]) -> Optional[str]:
+        """Pick the most likely direct media URL for a specific show ID."""
+        if not candidates:
+            return None
+        # Deduplicate preserving order
+        unique = []
+        seen = set()
+        for u in candidates:
+            if u not in seen:
+                unique.append(u)
+                seen.add(u)
+
+        def score(url: str) -> int:
+            s = 0
+            try:
+                parsed = urlparse(url)
+                if parsed.netloc.endswith('cablecast.tv'):
+                    s += 1
+                if video_id is not None:
+                    vid_str = str(int(video_id))
+                    path = parsed.path or ''
+                    query = parsed.query or ''
+                    if f"/{vid_str}-" in path or f"/{vid_str}_" in path or f"/{vid_str}/" in path:
+                        s += 6
+                    if f"show={vid_str}" in query:
+                        s += 3
+                    # Common store pattern: /store-X/<id>-Title/vod.mp4
+                    if '/store-' in path and f"/{vid_str}-" in path:
+                        s += 4
+            except Exception:
+                pass
+            return s
+
+        best = max(unique, key=score)
+        # If all scores are zero, fall back to the first candidate
+        if score(best) == 0:
+            return unique[0]
+        return best
 
     def is_fort_collins_meeting(self, title: str) -> bool:
         """
@@ -143,12 +281,12 @@ class FortCollinsVideoScraper:
                 logger.warning(f"Error parsing municode row: {e}")
                 continue
 
-    def extract_municode_meeting_data(self, row) -> dict | None:
+    def extract_municode_meeting_data(self, row) -> Optional[Dict[str, str]]:
         """Extract meeting data from Municode table row."""
         cells = row.find_all('td')
         if len(cells) < 2:
             return None
-        meeting_data: dict[str, str] = {
+        meeting_data: Dict[str, str] = {
             'date': '',
             'time': '',
             'title': '',
@@ -202,7 +340,11 @@ class FortCollinsVideoScraper:
         return meeting_data if meeting_data['title'] else None
 
     def scrape_cablecast_videos(self):
-        """Scrape Fort Collins videos from the Cablecast platform using search."""
+        """Scrape Fort Collins videos from the Cablecast platform using galleries and search."""
+        logger.info("Scraping Cablecast video platform via galleries...")
+        # First scrape the organized galleries - this is the primary method
+        self.scrape_cablecast_galleries()
+        
         logger.info("Scraping Cablecast video platform via search...")
         search_terms = [
             # City Council
@@ -226,6 +368,141 @@ class FortCollinsVideoScraper:
         for search_term in search_terms:
             self.search_cablecast_videos(search_term)
             time.sleep(2)  # polite delay
+
+    def scrape_cablecast_galleries(self):
+        """Scrape videos from the organized Cablecast galleries."""
+        galleries = [
+            {'id': 3, 'name': 'City Council Meetings', 'total_expected': 112},
+            {'id': 5, 'name': 'Urban Renewal Authority Board Meetings', 'total_expected': 4},
+            {'id': 6, 'name': 'Planning & Zoning Commission Meetings', 'total_expected': 35},
+            {'id': 4, 'name': 'Historic Preservation Commission Meetings', 'total_expected': 26}
+        ]
+        
+        for gallery in galleries:
+            logger.info(f"Scraping gallery: {gallery['name']} (ID {gallery['id']})")
+            self.scrape_single_gallery(gallery['id'], gallery['name'])
+            time.sleep(2)
+
+    def scrape_single_gallery(self, gallery_id: int, gallery_name: str):
+        """Scrape all pages of a single gallery."""
+        page = 1
+        videos_found = 0
+        
+        while True:
+            # Construct gallery URL with pagination
+            if page == 1:
+                url = f"https://reflect-vod-fcgov.cablecast.tv/internetchannel/gallery/{gallery_id}?site=1"
+            else:
+                offset = (page - 1) * 50
+                url = f"https://reflect-vod-fcgov.cablecast.tv/internetchannel/gallery/{gallery_id}?page={page}&fullText=null&page_size=50&offset={offset}&site=1"
+            
+            logger.info(f"Fetching {gallery_name} page {page}: {url}")
+            response = self.fetch_page(url)
+            
+            if not response:
+                logger.warning(f"Failed to fetch {gallery_name} page {page}")
+                break
+                
+            soup = BeautifulSoup(response.content, 'html.parser')
+            page_videos = self.extract_gallery_videos(soup, gallery_id)
+            
+            if not page_videos:
+                logger.info(f"No videos found on {gallery_name} page {page}, stopping pagination")
+                break
+                
+            videos_found += len(page_videos)
+            logger.info(f"Found {len(page_videos)} videos on {gallery_name} page {page}")
+            
+            # Check if there are more pages by looking for pagination elements
+            has_next_page = self.has_next_page(soup)
+            if not has_next_page:
+                break
+                
+            page += 1
+            time.sleep(1)  # Be polite
+            
+        logger.info(f"Gallery {gallery_name} complete: {videos_found} videos found")
+
+    def extract_gallery_videos(self, soup: BeautifulSoup, gallery_id: int) -> List[Dict]:
+        """Extract video data from a gallery page."""
+        videos_found = []
+        
+        # Look for video links in the gallery page
+        video_links = soup.find_all('a', href=re.compile(r'/internetchannel/show/\d+'))
+        if not video_links:
+            # Alternative: look for any show links
+            video_links = soup.find_all('a', href=re.compile(r'/show/\d+'))
+            
+        for link in video_links:
+            href = link.get('href', '')
+            if not href:
+                continue
+                
+            # Extract video ID
+            video_id_match = re.search(r'/show/(\d+)', href)
+            if not video_id_match:
+                continue
+                
+            video_id = int(video_id_match.group(1))
+            
+            # Get title from link text or nearby elements
+            title_text = link.get_text(strip=True)
+            if not title_text:
+                # Try to get title from parent or sibling elements
+                parent = link.parent
+                if parent:
+                    title_text = parent.get_text(strip=True)
+                    
+            if not title_text or not self.is_fort_collins_meeting(title_text):
+                continue
+                
+            # Build full URL
+            if href.startswith('/'):
+                full_url = f"https://reflect-vod-fcgov.cablecast.tv{href}"
+            else:
+                full_url = href
+                
+            # Add site parameter if not present
+            if '?site=1' not in full_url and '&site=1' not in full_url:
+                separator = '&' if '?' in full_url else '?'
+                full_url += f"{separator}site=1"
+                
+            # Fetch the individual video page to get full metadata
+            unique_key = f"gallery_{video_id}_{title_text}"
+            if unique_key not in self.processed_urls:
+                video_response = self.fetch_page(full_url)
+                if video_response:
+                    video_soup = BeautifulSoup(video_response.content, 'html.parser')
+                    meeting_data = self.extract_cablecast_video_data(video_soup, full_url, video_id)
+                    if meeting_data:
+                        self.meetings_data.append(meeting_data)
+                        self.processed_urls.add(unique_key)
+                        videos_found.append(meeting_data)
+                        logger.info(f"Added from gallery {gallery_id}: {meeting_data['title']}")
+                time.sleep(0.5)  # Be polite
+                
+        return videos_found
+
+    def has_next_page(self, soup: BeautifulSoup) -> bool:
+        """Check if there's a next page in the gallery pagination."""
+        # Look for pagination elements
+        next_links = soup.find_all('a', string=re.compile(r'Next|>', re.I))
+        if next_links:
+            return True
+            
+        # Look for page numbers higher than current
+        page_links = soup.find_all('a', href=re.compile(r'page=\d+'))
+        if len(page_links) > 1:  # More than just current page
+            return True
+            
+        # Look for specific pagination patterns
+        pagination_div = soup.find('div', class_=re.compile(r'pag', re.I))
+        if pagination_div:
+            # If pagination div exists and has multiple links, likely has more pages
+            links_in_pagination = pagination_div.find_all('a')
+            return len(links_in_pagination) > 1
+            
+        return False
 
     def search_cablecast_videos(self, search_term: str) -> None:
         """Execute multiple search queries on the Cablecast platform for a term."""
@@ -326,10 +603,10 @@ class FortCollinsVideoScraper:
                 if "404" not in str(e):
                     logger.debug(f"Error checking video {video_id}: {e}")
 
-    def extract_cablecast_video_data(self, soup: BeautifulSoup, page_url: str, video_id: int) -> dict | None:
+    def extract_cablecast_video_data(self, soup: BeautifulSoup, page_url: str, video_id: int) -> Optional[Dict[str, str]]:
         """Extract meeting data, MP4 download link and transcript URL from a Cablecast video page."""
         try:
-            meeting_data: dict[str, str] = {
+            meeting_data: Dict[str, str] = {
                 'date': '',
                 'time': '',
                 'title': '',
@@ -359,20 +636,48 @@ class FortCollinsVideoScraper:
                 time_match = re.search(r'(\d{1,2}:\d{2}\s*[AP]M)', title, re.IGNORECASE)
                 if time_match:
                     meeting_data['time'] = time_match.group(1)
-            # Find MP4 download link
-            download_links = soup.find_all('a', href=re.compile(r'\.mp4$'))
+            # Find direct media links aggressively
+            # 1) Straightforward <a href="*.mp4">
+            download_links = soup.find_all('a', href=re.compile(r'\.mp4($|\?)', re.I))
             for link in download_links:
                 href = link.get('href')
                 if href:
                     if href.startswith('http'):
                         meeting_data['mp4_download'] = href
                     else:
-                        meeting_data['mp4_download'] = urljoin('https://reflect-vod-fcgov.cablecast.tv/', href)
+                        meeting_data['mp4_download'] = urljoin(page_url, href)
                     break
-            # Fallback: parse page text for .mp4 URL
+
+            # 2) Scan common elements and scripts
             if not meeting_data['mp4_download']:
-                page_text = soup.get_text()
-                mp4_matches = re.findall(r'https://[^\s]*\.mp4', page_text)
+                media = self._extract_media_urls_from_html(soup, page_url)
+                if media.get('mp4'):
+                    meeting_data['mp4_download'] = self._pick_best_media_for_id(media['mp4'], video_id)
+                elif media.get('mpeg'):
+                    meeting_data['mp4_download'] = self._pick_best_media_for_id(media['mpeg'], video_id)
+                elif media.get('m3u8'):
+                    # Best-effort: attempt to derive an MP4 from HLS URL
+                    derived = self._pick_best_media_for_id(media['m3u8'], video_id) or media['m3u8'][0]
+                    candidate = derived.split('?', 1)[0].rsplit('.', 1)[0] + '.mp4'
+                    try:
+                        head = self.session.head(candidate, timeout=10, allow_redirects=True)
+                        if head.status_code == 200 and int(head.headers.get('content-length', '0')) > 0:
+                            meeting_data['mp4_download'] = candidate
+                    except Exception:
+                        pass
+
+            # 3) Follow iframes/player embeds and rescan
+            if not meeting_data['mp4_download']:
+                embed_media = self._follow_embeds_and_players(page_url, soup, video_id)
+                if embed_media.get('mp4'):
+                    meeting_data['mp4_download'] = embed_media['mp4'][0]
+                elif embed_media.get('mpeg'):
+                    meeting_data['mp4_download'] = embed_media['mpeg'][0]
+
+            # 4) Fallback: parse entire page text for .mp4 URL
+            if not meeting_data['mp4_download']:
+                page_text = soup.get_text(" ")
+                mp4_matches = re.findall(r'https?://[^\s"\'>]+\.mp4[^\s"\'>]*', page_text, flags=re.IGNORECASE)
                 if mp4_matches:
                     meeting_data['mp4_download'] = mp4_matches[0]
             # Attempt to determine transcript URL
@@ -429,14 +734,51 @@ class FortCollinsVideoScraper:
                     response = self.fetch_page(meeting['detail_page'])
                     if response:
                         soup = BeautifulSoup(response.content, 'html.parser')
+                        # Try anchors first
                         video_links = soup.find_all('a', href=re.compile(r'(video|stream|mp4|watch)', re.I))
                         for link in video_links:
                             href = link.get('href', '')
-                            if 'mp4' in href and not meeting['mp4_download']:
+                            if 'mp4' in href.lower() and not meeting['mp4_download']:
                                 meeting['mp4_download'] = urljoin(meeting['detail_page'], href)
                                 break
-                            elif ('cablecast' in href or 'stream' in href) and not meeting['video_link']:
+                            elif ('cablecast' in href.lower() or 'stream' in href.lower()) and not meeting['video_link']:
                                 meeting['video_link'] = urljoin(meeting['detail_page'], href)
+
+                        # If not found, scan DOM and scripts for media URLs
+                        if not meeting['mp4_download']:
+                            media = self._extract_media_urls_from_html(soup, meeting['detail_page'])
+                            if media.get('mp4'):
+                                meeting['mp4_download'] = self._pick_best_media_for_id(media['mp4'], meeting.get('video_id'))
+                            elif media.get('mpeg'):
+                                meeting['mp4_download'] = self._pick_best_media_for_id(media['mpeg'], meeting.get('video_id'))
+                            elif media.get('m3u8'):
+                                derived = self._pick_best_media_for_id(media['m3u8'], meeting.get('video_id')) or media['m3u8'][0]
+                                candidate = derived.split('?', 1)[0].rsplit('.', 1)[0] + '.mp4'
+                                try:
+                                    head = self.session.head(candidate, timeout=10, allow_redirects=True)
+                                    if head.status_code == 200 and int(head.headers.get('content-length', '0')) > 0:
+                                        meeting['mp4_download'] = candidate
+                                except Exception:
+                                    pass
+
+                        # If still not found, follow embeds from this page
+                        if not meeting['mp4_download']:
+                            # Try to deduce video_id from stored data or URL
+                            video_id = None
+                            try:
+                                if meeting.get('video_id'):
+                                    video_id = int(meeting['video_id'])
+                                else:
+                                    m = re.search(r'/show/(\d+)', meeting.get('video_link') or '')
+                                    if m:
+                                        video_id = int(m.group(1))
+                            except Exception:
+                                video_id = None
+                            embed_media = self._follow_embeds_and_players(meeting['detail_page'], soup, video_id)
+                            if embed_media.get('mp4'):
+                                meeting['mp4_download'] = embed_media['mp4'][0]
+                            elif embed_media.get('mpeg'):
+                                meeting['mp4_download'] = embed_media['mpeg'][0]
                         # If we found an MP4 now, attempt transcript again
                         if meeting['mp4_download'] and not meeting['transcript_url']:
                             try:
@@ -485,23 +827,40 @@ class FortCollinsVideoScraper:
         print(f"  Meetings with transcripts: {df['transcript_url'].notna().sum()}")
         print(f"\nCSV saved as: {filename}\n")
 
-    def run_comprehensive_scraper(self) -> None:
-        """Run the end‑to‑end scraping process across all sources."""
+    def run_comprehensive_scraper(self, quick: bool = False) -> None:
+        """Run the end‑to‑end scraping process across all sources.
+
+        If quick=True, skips the slow systematic ID range scan and saves after earlier phases.
+        """
         logger.info("Starting comprehensive Fort Collins meeting scraper...")
         try:
-            logger.info("=== Phase 1: Municode Meetings Portal ===")
+            # Phase 1: Municode
+            logger.info("=== Phase\u00a01: Municode Meetings Portal ===")
             self.scrape_municode_meetings()
-            logger.info("=== Phase 2: Cablecast Search ===")
+
+            # Phase 2: Cablecast (galleries + search)
+            logger.info("=== Phase\u00a02: Cablecast Search ===")
             self.scrape_cablecast_videos()
-            logger.info("=== Phase 3: Systematic Cablecast Archive Check ===")
-            self.scrape_cablecast_archive_systematic()
+
             if not self.meetings_data:
-                logger.error("No meeting data found from any source")
+                logger.error("No meeting data found from any source after Phase 2")
                 return
-            logger.info("=== Phase 4: Enhanced Data Collection ===")
+
+            # Enhance and save a partial checkpoint after early phases
+            logger.info("=== Phase\u00a03: Enhanced Data Collection (early) ===")
             self.enhance_with_additional_data()
-            logger.info("=== Phase 5: Saving Results ===")
+            logger.info("=== Saving partial results (post Phase 2/3) ===")
             self.save_to_csv()
+
+            # Optional Phase 4: Systematic scan (slow)
+            if not quick:
+                logger.info("=== Phase\u00a04: Systematic Cablecast Archive Check ===")
+                self.scrape_cablecast_archive_systematic()
+                if self.meetings_data:
+                    logger.info("=== Phase\u00a05: Enhanced Data Collection (final) ===")
+                    self.enhance_with_additional_data()
+                    logger.info("=== Phase\u00a06: Saving Results ===")
+                    self.save_to_csv()
             logger.info("Scraping completed successfully!")
         except Exception as e:
             logger.error(f"Scraping failed: {e}")
@@ -510,11 +869,22 @@ class FortCollinsVideoScraper:
 
 def main() -> None:
     """Entry point when running as a script."""
+    import argparse
+    parser = argparse.ArgumentParser(description='Fort Collins meeting scraper')
+    parser.add_argument('--quick', action='store_true', help='Skip slow ID-range scan; save after galleries/search')
+    args = parser.parse_args()
+    scraper = FortCollinsVideoScraper()
     try:
-        scraper = FortCollinsVideoScraper()
-        scraper.run_comprehensive_scraper()
+        scraper.run_comprehensive_scraper(quick=args.quick)
     except KeyboardInterrupt:
         logger.info("Scraping interrupted by user")
+        # Save whatever we have so far to avoid losing progress
+        try:
+            if scraper.meetings_data:
+                logger.info("Saving partial results before exit due to interruption...")
+                scraper.save_to_csv()
+        except Exception as e:
+            logger.warning(f"Failed to save partial results: {e}")
     except Exception as e:
         logger.error(f"Scraping failed: {e}")
 
